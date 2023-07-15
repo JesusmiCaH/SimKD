@@ -14,7 +14,6 @@ import torch.multiprocessing as mp
 import torch.backends.cudnn as cudnn
 import tensorboard_logger as tb_logger
 
-# nmsl
 from models import model_dict
 from dataset.cifar100 import get_cifar100_dataloaders
 from dataset.imagenet import get_imagenet_dataloader
