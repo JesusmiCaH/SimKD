@@ -16,10 +16,12 @@ import torch.multiprocessing as mp
 import torch.distributed as dist
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
-import tensorboard_logger as tb_logger
+import wandb
 
 from models import model_dict
 from models.util import ConvReg, SelfA, SRRL, SimKD
+# extra
+from models.resnet import ResNet
 
 from dataset.cifar100 import get_cifar100_dataloaders, get_cifar100_dataloaders_sample
 from dataset.imagenet import get_imagenet_dataloader,  get_dataloader_sample
@@ -41,12 +43,12 @@ def parse_option():
     parser.add_argument('--print_freq', type=int, default=200, help='print frequency')
     parser.add_argument('--batch_size', type=int, default=64, help='batch_size')
     parser.add_argument('--num_workers', type=int, default=8, help='num of workers to use')
-    parser.add_argument('--epochs', type=int, default=240, help='number of training epochs')
+    parser.add_argument('--epochs', type=int, default=30, help='number of training epochs')
     parser.add_argument('--gpu_id', type=str, default='0', help='id(s) for CUDA_VISIBLE_DEVICES')
 
     # optimization
-    parser.add_argument('--learning_rate', type=float, default=0.05, help='learning rate')
-    parser.add_argument('--lr_decay_epochs', type=str, default='150,180,210', help='where to decay lr, can be a list')
+    parser.add_argument('--learning_rate', type=float, default=4e-1, help='learning rate')
+    parser.add_argument('--lr_decay_epochs', type=str, default='20,50,100', help='where to decay lr, can be a list')
     parser.add_argument('--lr_decay_rate', type=float, default=0.1, help='decay rate for learning rate')
     parser.add_argument('--weight_decay', type=float, default=5e-4, help='weight decay')
     parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
@@ -54,12 +56,12 @@ def parse_option():
     # dataset and model
     parser.add_argument('--dataset', type=str, default='cifar100', choices=['cifar100', 'imagenet'], help='dataset')
     parser.add_argument('--model_s', type=str, default='resnet8x4')
-    parser.add_argument('--path_t', type=str, default=None, help='teacher model snapshot')
+    parser.add_argument('--path_t', type=str, default='./save/teachers/models/resnet32x4_vanilla_cifar100_trial_0/resnet32x4_best.pth', help='teacher model snapshot')
 
     # distillation
     parser.add_argument('--trial', type=str, default='1', help='trial id')
     parser.add_argument('--kd_T', type=float, default=4, help='temperature for KD distillation')
-    parser.add_argument('--distill', type=str, default='kd', choices=['kd', 'hint', 'attention', 'similarity', 'vid',
+    parser.add_argument('--distill', type=str, default='simkd', choices=['kd', 'hint', 'attention', 'similarity', 'vid',
                                                                       'crd', 'semckd','srrl', 'simkd'])
     parser.add_argument('-c', '--cls', type=float, default=1.0, help='weight for classification')
     parser.add_argument('-d', '--div', type=float, default=1.0, help='weight balance for KD')
@@ -144,31 +146,67 @@ def load_teacher(model_path, n_cls, gpu=None, opt=None):
     model.load_state_dict(torch.load(model_path, map_location=map_location)['model'])
     print('==> done')
     return model
-
-
 best_acc = 0
 total_time = time.time()
-def main():
-    
-    opt = parse_option()
-    
-    # ASSIGN CUDA_ID
-    os.environ['CUDA_VISIBLE_DEVICES'] = opt.gpu_id
-    
-    ngpus_per_node = torch.cuda.device_count()
-    opt.ngpus_per_node = ngpus_per_node
-    if opt.multiprocessing_distributed:
-        # Since we have ngpus_per_node processes per node, the total world_size
-        # needs to be adjusted accordingly
-        world_size = 1
-        opt.world_size = ngpus_per_node * world_size
-        # Use torch.multiprocessing.spawn to launch distributed processes: the
-        # main_worker process function
-        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, opt))
-    else:
-        main_worker(None if ngpus_per_node > 1 else opt.gpu_id, ngpus_per_node, opt)
+# set hyperparameters
+hyper_config={
+    'layer_num':{
+        #q:from 2 to 64 in log distribution
+        'distribution':'q_log_uniform_values',
+        'q':2,
+        'min':4,
+        'max':64,
+    },
+    'depth':{
+        #q:from 2 to 64 in log distribution
+        'values':[8,14,20,32],
+    },  
+}
+class Dict2Class():
+    def __init__(self, my_dict):
+        for key in my_dict:
+            setattr(self, key, my_dict[key])
 
-def main_worker(gpu, ngpus_per_node, opt):
+def wb_option(hyper_config, sweep_name, project_name):
+    sweep_config={
+        'method':'random',
+        'metric':{
+            #metric：目标是最小化loss。
+            'name':'train loss',
+            'goal':'minimize',
+        },
+    }
+    sweep_config['parameters'] = hyper_config
+    sweep_config['name'] = sweep_name
+    sweeper = wandb.sweep(sweep_config, project = project_name)
+    return sweeper
+
+def main():
+    with wandb.init(
+        project = 'distillation',
+        name = 'banana_milk',
+    ):                                
+
+        wandb_opt = Dict2Class(dict(wandb.config))
+
+        opt = parse_option()
+        # ASSIGN CUDA_ID
+        os.environ['CUDA_VISIBLE_DEVICES'] = opt.gpu_id
+        
+        ngpus_per_node = torch.cuda.device_count()
+        opt.ngpus_per_node = ngpus_per_node
+        if opt.multiprocessing_distributed:
+            # Since we have ngpus_per_node processes per node, the total world_size
+            # needs to be adjusted accordingly
+            world_size = 1
+            opt.world_size = ngpus_per_node * world_size
+            # Use torch.multiprocessing.spawn to launch distributed processes: the
+            # main_worker process function
+            mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, opt))
+        else:
+            main_worker(None if ngpus_per_node > 1 else opt.gpu_id, ngpus_per_node, opt, wandb_opt)
+
+def main_worker(gpu, ngpus_per_node, opt, wandb_opt):
     global best_acc, total_time
     opt.gpu = int(gpu)
     opt.gpu_id = int(gpu)
@@ -199,7 +237,9 @@ def main_worker(gpu, ngpus_per_node, opt):
     
     model_t = load_teacher(opt.path_t, n_cls, opt.gpu, opt)
     try:
-        model_s = model_dict[opt.model_s](num_classes=n_cls)
+        # model_s = model_dict[opt.model_s](num_classes=n_cls)
+        layersize = wandb_opt.layer_num
+        model_s = ResNet(wandb_opt.depth, [layersize, 2*layersize, 4*layersize, 8*layersize], 'basicblock', num_classes=n_cls)
     except KeyError:
         print("This model is not supported.")
 
@@ -281,11 +321,14 @@ def main_worker(gpu, ngpus_per_node, opt):
     criterion_list.append(criterion_kd)     # other knowledge distillation loss
 
     module_list.append(model_t)
-    
     optimizer = optim.SGD(trainable_list.parameters(),
-                          lr=opt.learning_rate,
-                          momentum=opt.momentum,
-                          weight_decay=opt.weight_decay)
+                        lr=opt.learning_rate,
+                        momentum = opt.momentum,
+                        weight_decay=opt.weight_decay)
+
+    # optimizer = optim.Adam(trainable_list.parameters(),
+    #                     lr=opt.learning_rate,
+    #                     weight_decay=opt.weight_decay)
 
     if torch.cuda.is_available():
         # For multiprocessing distributed, DistributedDataParallel constructor
@@ -313,9 +356,9 @@ def main_worker(gpu, ngpus_per_node, opt):
     if opt.dataset == 'cifar100':
         if opt.distill in ['crd']:
             train_loader, val_loader, n_data = get_cifar100_dataloaders_sample(batch_size=opt.batch_size,
-                                                                               num_workers=opt.num_workers,
-                                                                               k=opt.nce_k,
-                                                                               mode=opt.mode)
+                                                                            num_workers=opt.num_workers,
+                                                                            k=opt.nce_k,
+                                                                            mode=opt.mode)
         else:
             train_loader, val_loader = get_cifar100_dataloaders(batch_size=opt.batch_size,
                                                                         num_workers=opt.num_workers)
@@ -337,7 +380,7 @@ def main_worker(gpu, ngpus_per_node, opt):
         raise NotImplementedError(opt.dataset)
 
     if not opt.multiprocessing_distributed or opt.rank % ngpus_per_node == 0:
-        logger = tb_logger.Logger(logdir=opt.tb_folder, flush_secs=2)
+        pass
 
     if not opt.skip_validation:
         # validate teacher accuracy
@@ -372,10 +415,10 @@ def main_worker(gpu, ngpus_per_node, opt):
 
         if not opt.multiprocessing_distributed or opt.rank % ngpus_per_node == 0:
             print(' * Epoch {}, GPU {}, Acc@1 {:.3f}, Acc@5 {:.3f}, Time {:.2f}'.format(epoch, opt.gpu, train_acc, train_acc_top5, time2 - time1))
-            
-            logger.log_value('train_acc', train_acc, epoch)
-            logger.log_value('train_loss', train_loss, epoch)
-
+            wandb.log({'train loss': train_loss,
+                        'train acc1': train_acc,
+                        'train acc5': train_acc_top5,
+                        })
         print('GPU %d validating' % (opt.gpu))
         test_acc, test_acc_top5, test_loss = validate_distill(val_loader, module_list, criterion_cls, opt)        
 
@@ -385,11 +428,10 @@ def main_worker(gpu, ngpus_per_node, opt):
 
         if not opt.multiprocessing_distributed or opt.rank % ngpus_per_node == 0:
             print(' ** Acc@1 {:.3f}, Acc@5 {:.3f}'.format(test_acc, test_acc_top5))
-            
-            logger.log_value('test_acc', test_acc, epoch)
-            logger.log_value('test_loss', test_loss, epoch)
-            logger.log_value('test_acc_top5', test_acc_top5, epoch)
-
+            wandb.log({'test loss': test_loss,
+                        'test acc1': test_acc,
+                        'test acc5': test_acc_top5,
+                        'epoch': epoch})
             # save the best model
             if test_acc > best_acc:
                 best_acc = test_acc
@@ -425,4 +467,5 @@ def main_worker(gpu, ngpus_per_node, opt):
         save_dict_to_json(save_state, params_json_path)
 
 if __name__ == '__main__':
-    main()
+    wb_opt = wb_option(hyper_config, 'student', 'transfer_learner')
+    wandb.agent(wb_opt, main, count = 30)

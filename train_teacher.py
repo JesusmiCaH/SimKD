@@ -132,7 +132,7 @@ def main_worker(gpu, ngpus_per_node, opt):
         print("This model is not supported.")
 
     # optimizer
-    optimizer = optim.SGD(model.parameters(),
+    optimizer = optim.Adam(model.parameters(),
                           lr=opt.learning_rate,
                           momentum=opt.momentum,
                           weight_decay=opt.weight_decay)
